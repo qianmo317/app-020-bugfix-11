@@ -1,0 +1,7 @@
+services:
+  app-020:
+    build: .
+    container_name: app-020-bugfix-11
+    ports:
+      - "8200:80"
+    restart: unless-stopped
