@@ -76,16 +76,17 @@ type ValidationResult = { checkedAt: string; pass: boolean; items: ValidationIte
 全局状态为 `{ buildings, floors, rules, marks }`，`marks` 存各楼层的「您在此」坐标；默认规则集在 `src/rules/defaults.ts`（四类建筑各一套，均带依据文号，版本从 1 起）。
 
 ## 8. 关键算法
-1. **走道栅格图 + Dijkstra**（`src/lib/graph.ts`）：把可行走多边形按 **0.25m** 栅格化（射线法掩码 + 按多边形 bbox 预过滤），再做 **1 格 4 邻膨胀**补上共边房间之间的断缝；安全出口节点按 **2.5m**、门节点按 **1.5m** 吸附到最近栅格点；8 邻连通，对角要求两个正交邻居都可行（防切角穿墙）；二叉堆多源 Dijkstra 得每个栅格点到最近出口的路径距离。栅格数超过 8,000,000 直接抛 `floor too large for grid`。
-2. **房间疏散距离**（`engine.ts` 的 `roomWorstTravelM`）：房间内采样 0.5m 栅格点 **加上全部多边形顶点**（保证非凸房间的最远角不漏），房间内取「最远点 → 房间门」直线段，再加上门到出口的路径距离；房间内本身有出口时只算房内直线。
-3. **门推断**（`geometry.ts` 的 `doorCandidates`）：沿房间边界每 100mm 采样，用两侧 80mm 探针判断是否命中走道，连续命中且长度 ≥400mm 取中点作为门。
-4. **袋形走道死端**（`graph.ts` 的 `computeDeadEnd`）：多出口时 `depth(n) = min over 出口对 (i,j) of (d(n,i) + d(n,j) − D(i,j)) / 2`；单出口时 `depth(n) = d(n, 唯一出口)`，取全部栅格点的最大值。可用出口上限取 12 个。
-5. **灭火器覆盖**（`engine.ts` 的 `computeCoverage`）：0.5m 格心采样，格心落在任一灭火器保护圆内即整格算已覆盖，未覆盖面积 = 未覆盖格数 × 0.25㎡；`uncoveredM2 <= max(2, 楼层面积 × 5%)` 才合格。用边长 `max(radius, 5m)` 的桶哈希，仅检查 3×3 邻桶内的点位。
-6. **安全出口数量**：`required = (楼层总面积 > exitMinAreaM2 或 估算人数 > exitMaxOccupants) ? 2 : 1`；人数未填时按用途密度估算（办公 10、商业 3、仓库 50、病房 8、走道 0、其他 20 ㎡/人）。
-7. **检查到期**（`checkDueInfo`）：按日期取最近一次记录，应检日期 = 最近检查 + 周期（灭火器 30 天、消火栓 30 天、疏散指示灯 90 天、应急照明 90 天、安全出口 180 天、喷淋 180 天）；`damaged`/`missing` 记 `defect`（error），无记录 `CHECK_MISSING`（warning），超周期 `CHECK_OVERDUE`（warning）；日期按本地时区拼接，避免 `toISOString` 跨时区提前一天。
-8. **结论与排序**：`pass = 无 error 项 且 灭火器覆盖合格`；列表 error 置前，同类按 `value / limit` 降序。
-9. **渲染**：全部走 SVG，1 用户单位 = 1mm，缩放是 viewBox 变换（不重算几何）；图纸含 1m/5m 网格、房间多边形与面积标注、设施符号、未覆盖栅格高亮、校验定位红圈。
-10. **状态管理**（`src/store/store.ts`）：手写外部 store + `useSyncExternalStore`；每次 `setState` 浅拷贝各顶层容器并替换被改动的对象引用，保证选择器能感知更新（`tests/store.test.ts` S1 就是这条的回归）。
+1. **走道栅格图 + Dijkstra**（`src/lib/graph.ts`）：把可行走多边形按 **0.25m** 做**边界包含式栅格化**（射线法标内部 + 沿每条边 0.0625m 细采样补回落在边界上的栅格点，按多边形 bbox 预过滤）。**不做栅格膨胀**：膨胀会把两段走道间的真缝（平行墙、留缝的端头）桥成连通，制造穿墙捷径、系统性偏小疏散距离；共边多边形只需在共享边上都有栅格点即天然连通，斜角单格相碰（没有公共边）不会连通。安全出口（2.5m）、房间门（1.5m）**不再作为独立图节点**，而是投影到掩码内「最近且连接段全程可行走」的栅格落点（`segmentClear` 沿段采样，杜绝穿墙挂到墙后；旧实现出口挂接允许 2.5m、反向边只认 1.5m，1.5~2.5m 的出口会单向连通并让整层距离静默丢失）。8 邻连通，对角要求两个正交邻居都可行（防切角穿墙）；二叉堆多源 Dijkstra 得每个栅格点到最近出口的路径距离。栅格数超过 8,000,000 直接抛 `floor too large for grid`。
+2. **走道断裂检测**：多源 Dijkstra 的「距离有限」不能证明可行走区域连通——两个断开组分各自带出口时两边都有限。因此额外从全部出口落点做一次 8 邻 BFS 泛洪（沿用切角规则），未被淹到的可行走点即「到不了任何出口的孤岛」，报 `WALK_NOT_CONNECTED`（error），不再静默当作合格。
+3. **房间疏散距离**（`graph.ts` 的 `roomWorstPath`）：房间多边形按 0.25m **单独栅格化**（同一套边界包含式掩码），门点与房内出口投影为多源源点（门源初始距离 = 门到最近出口的走道段；贴共边的门零残段直连），房内多源 Dijkstra 得到**沿房间内部绕行**的路径，再对**全部多边形顶点**逐个补测（射线法采样会漏掉角点，角点往往就是最远点；U/L 形非凸房间不再穿墙取直线）。没有任何门/出口能落到房间掩码上时返回 `connected=false`，引擎报 `ROOM_UNREACHABLE`（error），不再把该房间静默放行。
+4. **门推断**（`geometry.ts` 的 `doorCandidates`）：沿房间边界每 100mm 采样，用两侧 80mm 探针判断是否命中走道，连续命中且长度 ≥400mm 取中点作为门。
+5. **袋形走道死端**（`graph.ts` 的 `computeDeadEnd`）：多出口时 `depth(n) = min over 出口对 (i,j) of (d(n,i) + d(n,j) − D(i,j)) / 2`；单出口时 `depth(n) = d(n, 唯一出口)`，取全部栅格点的最大值。可用出口上限取 12 个。
+6. **灭火器覆盖**（`engine.ts` 的 `computeCoverage`）：0.5m 格心采样，格心落在任一灭火器保护圆内即整格算已覆盖，未覆盖面积 = 未覆盖格数 × 0.25㎡；`uncoveredM2 <= max(2, 楼层面积 × 5%)` 才合格。用边长 `max(radius, 5m)` 的桶哈希，仅检查 3×3 邻桶内的点位。
+7. **安全出口数量**：`required = (楼层总面积 > exitMinAreaM2 或 估算人数 > exitMaxOccupants) ? 2 : 1`；人数未填时按用途密度估算（办公 10、商业 3、仓库 50、病房 8、走道 0、其他 20 ㎡/人）。
+8. **检查到期**（`checkDueInfo`）：按日期取最近一次记录，应检日期 = 最近检查 + 周期（灭火器 30 天、消火栓 30 天、疏散指示灯 90 天、应急照明 90 天、安全出口 180 天、喷淋 180 天）；`damaged`/`missing` 记 `defect`（error），无记录 `CHECK_MISSING`（warning），超周期 `CHECK_OVERDUE`（warning）；日期按本地时区拼接，避免 `toISOString` 跨时区提前一天。
+9. **结论与排序**：`pass = 无 error 项 且 灭火器覆盖合格`；列表 error 置前，同类按 `value / limit` 降序。
+10. **渲染**：全部走 SVG，1 用户单位 = 1mm，缩放是 viewBox 变换（不重算几何）；图纸含 1m/5m 网格、房间多边形与面积标注、设施符号、未覆盖栅格高亮、校验定位红圈。
+11. **状态管理**（`src/store/store.ts`）：手写外部 store + `useSyncExternalStore`；每次 `setState` 浅拷贝各顶层容器并替换被改动的对象引用，保证选择器能感知更新（`tests/store.test.ts` S1 就是这条的回归）。
 
 ## 9. 交互与视觉要点
 - 编辑器三栏：左侧工具与元素库、中间 SVG 图纸、右侧校验面板与属性面板；滚轮以光标为锚点缩放（0.008 ~ 3），空白处或中键拖动平移，画多边形时 `Enter` 或双击起点闭合、`Esc` 取消。
@@ -95,8 +96,8 @@ type ValidationResult = { checkedAt: string; pass: boolean; items: ValidationIte
 - 破坏性操作（删建筑、删楼层）都有 `confirm` 二次确认；顶栏常驻「数据仅存于本机浏览器 · 断网可用」。
 
 ## 10. 验收标准
-- 单元测试 **7 个文件 / 59 个用例**全部通过（vitest 2.1.9，`npm test`）：疏散距离 20 组、灭火器覆盖 10 组、检查台账 7 组、编号 6 组、store 回归 10 组、规则切换 4 组、性能 2 组。
-- 疏散距离：20 组沿路径用例与手工沿路径测量的误差 < 0.5m；其中第 04 组必须证明「直线距离 ≤40m 看着合格、沿路径 >50m 实际超标」被判 `TRAVEL_EXCEED` 且 `pass=false`。
+- 单元测试 **7 个文件 / 67 个用例**全部通过（vitest 2.1.9，`npm test`）：疏散距离 28 组、灭火器覆盖 10 组、检查台账 7 组、编号 6 组、store 回归 10 组、规则切换 4 组、性能 2 组。
+- 疏散距离：28 组沿路径用例与手工沿路径测量的误差 < 0.5m；其中第 04 组必须证明「直线距离 ≤40m 看着合格、沿路径 >50m 实际超标」被判 `TRAVEL_EXCEED` 且 `pass=false`；第 21/22 组证明走道真缝（0.4m 端头缝、0.5m 平行墙缝）不再被栅格膨胀桥接、无出口组分报 `WALK_NOT_CONNECTED`；第 23 组证明落在墙外 2m 的出口报 `EXIT_NOT_CONNECTED`（旧实现会让整层距离静默丢失）；第 24 组证明房间多边形顶点必被采样；第 25 组证明 U 形房内部沿可行走路径绕行（旧直线穿墙少算 ≈6m）；第 26/26b 组证明门接不上可行走区域时报 `ROOM_UNREACHABLE` 而非静默合格；第 27 组为真实共边（Z 形）连通的对照，不得误报断裂。
 - 灭火器覆盖：10 组未覆盖面积与人工核算（圆面积差集、条带面积）误差 ≤10%，且格心采样总面积与房间面积一致（20×20 房间 = 400㎡）。
 - 台账：过期项 **100%** 出现在校验结果中（L6 按 `facilityId` 对账，无遗漏也无多余）；`damaged`/`missing` 为 error 级且排在最前。
 - 规则：同一张图纸在办公 / 厂房 / 商业规则下结论翻转；改规则后版本 +1，`rulesSnapshot` 记下版本与依据文号。
@@ -128,7 +129,7 @@ type ValidationResult = { checkedAt: string; pass: boolean; items: ValidationIte
 
 ```bash
 cd app-020
-npm test                                  # 7 个文件 59 个用例
+npm test                                  # 7 个文件 67 个用例
 docker compose up -d --build
 curl http://localhost:8100/healthz        # 期望输出 ok
 docker compose down

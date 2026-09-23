@@ -1,9 +1,10 @@
 import type { Pt } from '../model';
-import { bboxOf, pointInPoly } from './geometry';
+import { rasterizePolys, segmentClear, type WalkMask } from './geometry';
 
 /**
- * 走道栅格图：把可行走区域多边形栅格化（默认 0.25m），
- * 安全出口/房间门作为附加节点连接到最近栅格点，多源 Dijkstra 求任意点到最近出口的路径距离。
+ * 走道栅格图：把可行走区域多边形栅格化（默认 0.25m，边界包含式补点、不做膨胀），
+ * 安全出口/房间门投影到掩码内最近的可行走栅格点（落点必须在可行走区域内、连接段不穿墙），
+ * 多源 Dijkstra 求任意点到最近出口的路径距离。
  *
  * 疏散距离必须沿路径算，不是直线距离——L 形走道中直线距离会系统性低估，属于原则性错误。
  */
@@ -12,16 +13,117 @@ export type DoorInput = { roomId: string; pt: Pt };
 export type CorridorGraph = {
   step: number; // mm
   nLattice: number;
-  nTotal: number;
   pts: Float64Array; // [x0,y0,x1,y1,...]
   dist: Float64Array; // 到最近出口的路径距离 mm（Infinity=不可达）
   doorDist: number[]; // 每个输入 door 的路径距离 mm（Infinity=未连接）
   exitConnected: boolean[];
   deadEndMax: number; // mm，袋形走道（死端）最大长度
+  hasUnreachable: boolean; // 存在不与任何出口连通的可行走组分
   nodeAtLattice: (x: number, y: number) => number; // 栅格点 → 节点序号（-1 不存在）
 };
 
 const SQRT2 = Math.SQRT2;
+const EXIT_SNAP_IN_ROOM = 2500; // 房内出口吸附半径 2.5m
+
+/** 栅格掩码上的多源 Dijkstra（二叉堆）。dist 按 cell 线性索引，非掩码点为 Infinity。
+ * 8 邻连通，对角要求两个正交邻居都可行（防切角穿墙）。 */
+export function gridDistances(mask: WalkMask, sources: { i: number; j: number; d: number }[]): Float64Array {
+  const { step, nx, ny, mask: m } = mask;
+  const N = nx * ny;
+  const dd = new Float64Array(N).fill(Infinity);
+  const walkAt = (i: number, j: number) => i >= 0 && i < nx && j >= 0 && j < ny && m[j * nx + i] === 1;
+  const heapI: number[] = [];
+  const heapJ: number[] = [];
+  const heapD: number[] = [];
+  const push = (i: number, j: number, d: number) => {
+    heapI.push(i);
+    heapJ.push(j);
+    heapD.push(d);
+    let k = heapD.length - 1;
+    while (k > 0) {
+      const p = (k - 1) >> 1;
+      if (heapD[p] <= heapD[k]) break;
+      [heapI[p], heapI[k]] = [heapI[k], heapI[p]];
+      [heapJ[p], heapJ[k]] = [heapJ[k], heapJ[p]];
+      [heapD[p], heapD[k]] = [heapD[k], heapD[p]];
+      k = p;
+    }
+  };
+  const pop = (): { i: number; j: number; d: number } | null => {
+    if (!heapD.length) return null;
+    const i = heapI[0], j = heapJ[0], d = heapD[0];
+    const li = heapI.pop()!, lj = heapJ.pop()!, ld = heapD.pop()!;
+    if (heapD.length) {
+      heapI[0] = li;
+      heapJ[0] = lj;
+      heapD[0] = ld;
+      let k = 0;
+      for (;;) {
+        const l = k * 2 + 1;
+        const r = l + 1;
+        let mm = k;
+        if (l < heapD.length && heapD[l] < heapD[mm]) mm = l;
+        if (r < heapD.length && heapD[r] < heapD[mm]) mm = r;
+        if (mm === k) break;
+        [heapI[mm], heapI[k]] = [heapI[k], heapI[mm]];
+        [heapJ[mm], heapJ[k]] = [heapJ[k], heapJ[mm]];
+        [heapD[mm], heapD[k]] = [heapD[k], heapD[mm]];
+        k = mm;
+      }
+    }
+    return { i, j, d };
+  };
+  for (const s of sources) {
+    const c = s.j * nx + s.i;
+    if (walkAt(s.i, s.j) && s.d < dd[c]) {
+      dd[c] = s.d;
+      push(s.i, s.j, s.d);
+    }
+  }
+  let top;
+  while ((top = pop())) {
+    const { i, j, d } = top;
+    if (d > dd[j * nx + i]) continue;
+    for (let dj = -1; dj <= 1; dj++) {
+      for (let di = -1; di <= 1; di++) {
+        if (di === 0 && dj === 0) continue;
+        const ni = i + di, nj = j + dj;
+        if (!walkAt(ni, nj)) continue;
+        if (di !== 0 && dj !== 0 && !(walkAt(i + di, j) && walkAt(i, j + dj))) continue;
+        const nd = d + (di !== 0 && dj !== 0 ? SQRT2 : 1) * step;
+        const nc = nj * nx + ni;
+        if (nd < dd[nc]) {
+          dd[nc] = nd;
+          push(ni, nj, nd);
+        }
+      }
+    }
+  }
+  return dd;
+}
+
+type Landing = { i: number; j: number; d: number };
+
+/** 把出口/门点投影到掩码内最近可行走栅格点：
+ * 在 snap 环内枚举全部可行走格，取「连接段全程可行走」（不穿墙）且距离最小者。
+ * 不能只看最近格——最近点可能隔着一堵薄墙，绕到墙两侧的次近点才是真落点。 */
+function nearestLanding(p: Pt, snap: number, walkMask: WalkMask): Landing | null {
+  const { step, ox, oy, nx, ny, mask: m } = walkMask;
+  const ci = Math.round((p.x - ox) / step);
+  const cj = Math.round((p.y - oy) / step);
+  const r = Math.ceil(snap / step);
+  let best: Landing | null = null;
+  for (let j = cj - r; j <= cj + r; j++) {
+    for (let i = ci - r; i <= ci + r; i++) {
+      if (i < 0 || i >= nx || j < 0 || j >= ny || m[j * nx + i] !== 1) continue;
+      const q = { x: ox + i * step, y: oy + j * step };
+      const d = Math.hypot(q.x - p.x, q.y - p.y);
+      if (d > snap || (best && d >= best.d)) continue;
+      if (segmentClear(p, q, walkMask)) best = { i, j, d };
+    }
+  }
+  return best;
+}
 
 export function buildCorridorGraph(
   walkPolys: Pt[][],
@@ -29,263 +131,179 @@ export function buildCorridorGraph(
   doors: DoorInput[],
   step: number,
 ): CorridorGraph {
-  const bb = bboxOf(walkPolys);
-  const ox = Math.floor(bb.minX / step) * step;
-  const oy = Math.floor(bb.minY / step) * step;
-  const nx = Math.ceil((bb.maxX - ox) / step) + 1;
-  const ny = Math.ceil((bb.maxY - oy) / step) + 1;
+  const walkMask = rasterizePolys(walkPolys, step)!;
+  const { ox, oy, nx, ny, mask: m } = walkMask;
   const cellCount = nx * ny;
-  if (cellCount > 8_000_000) throw new Error('floor too large for grid');
 
-  // 栅格可行性掩码与节点编号。
-  // 掩码按「多边形 bbox 预filter + 逐点射线法」生成，再做 1 格膨胀（4 邻）：
-  // 射线法会排除多边形边界点，两个共边多边形（房间与走道）会在边界处留下断缝，
-  // 膨胀 1 格把边界行补上，同时不引入对角接触的误连通。
-  const inside = new Uint8Array(cellCount);
   const nodeIdx = new Int32Array(cellCount).fill(-1);
-  const latticePts: number[] = [];
   let nLattice = 0;
-  for (const poly of walkPolys) {
-    const pbb = bboxOf([poly]);
-    const i0 = Math.max(0, Math.floor((pbb.minX - ox) / step));
-    const i1 = Math.min(nx - 1, Math.ceil((pbb.maxX - ox) / step));
-    const j0 = Math.max(0, Math.floor((pbb.minY - oy) / step));
-    const j1 = Math.min(ny - 1, Math.ceil((pbb.maxY - oy) / step));
-    for (let j = j0; j <= j1; j++) {
-      for (let i = i0; i <= i1; i++) {
-        if (pointInPoly({ x: ox + i * step, y: oy + j * step }, poly)) inside[j * nx + i] = 1;
-      }
-    }
-  }
-  const mask = new Uint8Array(cellCount);
+  const pts = new Float64Array(cellCount * 2);
   for (let j = 0; j < ny; j++) {
     for (let i = 0; i < nx; i++) {
-      if (inside[j * nx + i]) {
-        mask[j * nx + i] = 1;
-        continue;
-      }
-      if (
-        (i > 0 && inside[j * nx + i - 1]) ||
-        (i < nx - 1 && inside[j * nx + i + 1]) ||
-        (j > 0 && inside[(j - 1) * nx + i]) ||
-        (j < ny - 1 && inside[(j + 1) * nx + i])
-      ) {
-        mask[j * nx + i] = 1;
+      const c = j * nx + i;
+      if (m[c] === 1) {
+        nodeIdx[c] = nLattice;
+        pts[nLattice * 2] = ox + i * step;
+        pts[nLattice * 2 + 1] = oy + j * step;
+        nLattice++;
       }
     }
   }
-  for (let c = 0; c < cellCount; c++) {
-    if (mask[c]) {
-      nodeIdx[c] = nLattice++;
-      latticePts.push(ox + (c % nx) * step, oy + Math.floor(c / nx) * step);
-    }
-  }
-  const cell = (i: number, j: number) => j * nx + i;
-  const walkAt = (i: number, j: number) =>
-    i >= 0 && i < nx && j >= 0 && j < ny && mask[cell(i, j)] === 1;
+
+  const EXIT_SNAP = 2500; // 2.5m
+  const DOOR_SNAP = 1500; // 1.5m
 
   const nExits = exitPts.length;
   const nDoors = doors.length;
-  const nTotal = nLattice + nExits + nDoors;
 
-  const pts = new Float64Array(nTotal * 2);
-  for (let u = 0; u < nLattice; u++) {
-    pts[u * 2] = latticePts[u * 2];
-    pts[u * 2 + 1] = latticePts[u * 2 + 1];
-  }
-
-  // 附加节点（出口/门）→ 最近栅格点
-  const EXIT_SNAP = 2500; // 2.5m
-  const DOOR_SNAP = 1500; // 1.5m
-  const attached = new Map<number, { extra: number; d: number }[]>(); // 栅格点 → 挂上的附加节点
-  const attach = (p: Pt, snap: number): { node: number; d: number } | null => {
-    // 在出口/门附近的栅格环内找最近点（比全量扫描快）
-    const ci = Math.round((p.x - ox) / step);
-    const cj = Math.round((p.y - oy) / step);
-    const r = Math.ceil(snap / step);
-    let best = -1;
-    let bestD = Infinity;
-    for (let j = cj - r; j <= cj + r; j++) {
-      for (let i = ci - r; i <= ci + r; i++) {
-        if (!walkAt(i, j)) continue;
-        const u = nodeIdx[cell(i, j)];
-        const d = Math.hypot(pts[u * 2] - p.x, pts[u * 2 + 1] - p.y);
-        if (d < bestD) {
-          bestD = d;
-          best = u;
-        }
-      }
-    }
-    if (best < 0 || bestD > snap) return null;
-    return { node: best, d: bestD };
-  };
-
+  // 出口落点：投影到可行走区域内
   const exitConnected: boolean[] = [];
+  const exitLandings: (Landing | null)[] = [];
   for (let e = 0; e < nExits; e++) {
-    const u = nLattice + e;
-    pts[u * 2] = exitPts[e].x;
-    pts[u * 2 + 1] = exitPts[e].y;
-    const a = attach(exitPts[e], EXIT_SNAP);
-    exitConnected.push(!!a);
-    if (a) {
-      const list = attached.get(a.node) ?? [];
-      list.push({ extra: u, d: a.d });
-      attached.set(a.node, list);
-    }
-  }
-  const doorDist: number[] = [];
-  for (let k = 0; k < nDoors; k++) {
-    const u = nLattice + nExits + k;
-    pts[u * 2] = doors[k].pt.x;
-    pts[u * 2 + 1] = doors[k].pt.y;
-    const a = attach(doors[k].pt, DOOR_SNAP);
-    if (a) {
-      const list = attached.get(a.node) ?? [];
-      list.push({ extra: u, d: a.d });
-      attached.set(a.node, list);
-      doorDist.push(0); // 占位，Dijkstra 后回填
-    } else {
-      doorDist.push(Infinity);
-    }
+    const land = nearestLanding(exitPts[e], EXIT_SNAP, walkMask);
+    exitLandings.push(land);
+    exitConnected.push(!!land);
   }
 
-  // 邻居枚举：栅格点 → 8 邻 + 挂载附加节点；附加节点 → 其挂载栅格点
-  const relax = (u: number, fn: (v: number, w: number) => void) => {
-    if (u < nLattice) {
-      const x = pts[u * 2];
-      const y = pts[u * 2 + 1];
-      const i = Math.round((x - ox) / step);
-      const j = Math.round((y - oy) / step);
+  // 门落点
+  const doorLandings: (Landing | null)[] = [];
+  for (let k = 0; k < nDoors; k++) doorLandings.push(nearestLanding(doors[k].pt, DOOR_SNAP, walkMask));
+
+  // 主结果：多源 Dijkstra（每个已连接出口的落点为源，初始距离 = 出口→落点残段）
+  const sources = exitLandings
+    .filter((l): l is Landing => !!l)
+    .map((l) => ({ i: l.i, j: l.j, d: l.d }));
+  const cellDist = gridDistances(walkMask, sources);
+
+  // 压缩到节点序
+  const dist = new Float64Array(nLattice).fill(Infinity);
+  for (let c = 0; c < cellCount; c++) {
+    const u = nodeIdx[c];
+    if (u >= 0) dist[u] = cellDist[c];
+  }
+
+  // 不可达组分：多源 Dijkstra 里「距离有限」只说明该点靠近某个出口源，
+  // 但断开组分各自带出口时两边都会有限。必须从所有出口落点做一次 BFS 泛洪
+  // （8 邻，沿用切角规则），没被淹到的可行走点才是真正到不了任何出口的区域。
+  const reached = new Uint8Array(cellCount);
+  {
+    const queue: number[] = [];
+    for (const l of sources) {
+      const c = l.j * nx + l.i;
+      if (!reached[c]) { reached[c] = 1; queue.push(c); }
+    }
+    const walkAt = (i: number, j: number) => i >= 0 && i < nx && j >= 0 && j < ny && m[j * nx + i] === 1;
+    let head = 0;
+    while (head < queue.length) {
+      const c = queue[head++];
+      const i = c % nx, j = (c - i) / nx;
       for (let dj = -1; dj <= 1; dj++) {
         for (let di = -1; di <= 1; di++) {
           if (di === 0 && dj === 0) continue;
-          if (!walkAt(i + di, j + dj)) continue;
-          // 对角：两个正交邻居都可行才连，防止切角穿墙
+          const ni = i + di, nj = j + dj;
+          if (!walkAt(ni, nj)) continue;
           if (di !== 0 && dj !== 0 && !(walkAt(i + di, j) && walkAt(i, j + dj))) continue;
-          fn(nodeIdx[cell(i + di, j + dj)], (di !== 0 && dj !== 0 ? SQRT2 : 1) * step);
-        }
-      }
-      const list = attached.get(u);
-      if (list) for (const a of list) fn(a.extra, a.d);
-    } else {
-      // 附加节点：只连其挂载的栅格点
-      const x = pts[u * 2];
-      const y = pts[u * 2 + 1];
-      const ci = Math.round((x - ox) / step);
-      const cj = Math.round((y - oy) / step);
-      for (let dj = -1; dj <= 1; dj++) {
-        for (let di = -1; di <= 1; di++) {
-          if (!walkAt(ci + di, cj + dj)) continue;
-          const v = nodeIdx[cell(ci + di, cj + dj)];
-          const d = Math.hypot(pts[v * 2] - x, pts[v * 2 + 1] - y);
-          if (d <= DOOR_SNAP) fn(v, d);
+          const nc = nj * nx + ni;
+          if (!reached[nc]) { reached[nc] = 1; queue.push(nc); }
         }
       }
     }
-  };
-
-  // Dijkstra（二叉堆）。供多源（全部已连接出口）与单源（逐出口，供死端计算）复用。
-  const runDijkstra = (sources: { u: number; d: number }[]): Float64Array => {
-    const dd = new Float64Array(nTotal).fill(Infinity);
-    const heapU: number[] = [];
-    const heapD: number[] = [];
-    const push = (u: number, d: number) => {
-      heapU.push(u);
-      heapD.push(d);
-      let i = heapU.length - 1;
-      while (i > 0) {
-        const p = (i - 1) >> 1;
-        if (heapD[p] <= heapD[i]) break;
-        [heapU[p], heapU[i]] = [heapU[i], heapU[p]];
-        [heapD[p], heapD[i]] = [heapD[i], heapD[p]];
-        i = p;
-      }
-    };
-    const pop = (): { u: number; d: number } | null => {
-      if (!heapU.length) return null;
-      const u = heapU[0];
-      const d = heapD[0];
-      const lu = heapU.pop()!;
-      const ld = heapD.pop()!;
-      if (heapU.length) {
-        heapU[0] = lu;
-        heapD[0] = ld;
-        let i = 0;
-        for (;;) {
-          const l = i * 2 + 1;
-          const r = l + 1;
-          let m = i;
-          if (l < heapU.length && heapD[l] < heapD[m]) m = l;
-          if (r < heapU.length && heapD[r] < heapD[m]) m = r;
-          if (m === i) break;
-          [heapU[m], heapU[i]] = [heapU[i], heapU[m]];
-          [heapD[m], heapD[i]] = [heapD[i], heapD[m]];
-          i = m;
-        }
-      }
-      return { u, d };
-    };
-    for (const s of sources) {
-      if (s.d < dd[s.u]) {
-        dd[s.u] = s.d;
-        push(s.u, s.d);
-      }
-    }
-    while (heapU.length) {
-      const top = pop()!;
-      if (top.d > dd[top.u]) continue;
-      relax(top.u, (v, w) => {
-        const nd = top.d + w;
-        if (nd < dd[v]) {
-          dd[v] = nd;
-          push(v, nd);
-        }
-      });
-    }
-    return dd;
-  };
-
-  // 主结果：任意点到最近出口的路径距离
-  const exitSources: { u: number; d: number }[] = [];
-  for (let e = 0; e < nExits; e++) {
-    if (exitConnected[e]) exitSources.push({ u: nLattice + e, d: 0 });
   }
-  const dist = runDijkstra(exitSources);
-
-  // 回填门节点距离
-  for (let k = 0; k < nDoors; k++) {
-    if (doorDist[k] !== Infinity) doorDist[k] = dist[nLattice + nExits + k];
+  let hasUnreachable = false;
+  for (let c = 0; c < cellCount; c++) {
+    if (m[c] === 1 && !reached[c]) { hasUnreachable = true; break; }
   }
+
+  // 门距离 = 落点残段 + 落点处路径距离
+  const doorDist: number[] = doorLandings.map((l) =>
+    l ? l.d + cellDist[l.j * nx + l.i] : Infinity,
+  );
 
   // 死端（袋形走道）：对每个已连接出口各跑一次单源 Dijkstra（出口通常 ≤ 6 个，
   // 上限取 12，更多时忽略多余出口——出口数量本身受 EXIT_COUNT 规则约束）。
-  const deadEndExitIdx: number[] = [];
-  for (let e = 0; e < nExits && deadEndExitIdx.length < 12; e++) {
-    if (exitConnected[e]) deadEndExitIdx.push(e);
-  }
-  const perExit = deadEndExitIdx.map((e) => runDijkstra([{ u: nLattice + e, d: 0 }]));
-  const deadEndMax = computeDeadEnd(
-    perExit,
-    deadEndExitIdx.map((e) => nLattice + e),
-    nLattice,
-  );
+  const perExitLandings = exitLandings.filter((l): l is Landing => !!l).slice(0, 12);
+  const perExit = perExitLandings.map((l) => gridDistances(walkMask, [{ i: l.i, j: l.j, d: l.d }]));
+  const deadEndMax = computeDeadEnd(perExit, perExitLandings, nodeIdx, walkMask);
 
   return {
     step,
     nLattice,
-    nTotal,
-    pts,
+    pts: pts.subarray(0, nLattice * 2) as Float64Array,
     dist,
     doorDist,
     exitConnected,
     deadEndMax,
+    hasUnreachable,
     nodeAtLattice: (x: number, y: number) => {
       const i = Math.round((x - ox) / step);
       const j = Math.round((y - oy) / step);
-      if (!walkAt(i, j)) return -1;
-      return nodeIdx[cell(i, j)];
+      if (i < 0 || i >= nx || j < 0 || j >= ny) return -1;
+      return nodeIdx[j * nx + i];
     },
   };
+}
+
+/** 房间内沿路径最不利距离。
+ *
+ * 与走道同口径：房间多边形单独栅格化（边界包含式），门与房内出口投影到掩码内，
+ * 多源 Dijkstra 求每个可行走点的逃生路径长度，再补测全部多边形顶点。
+ * - 非凸房间（U 形、L 形）不再穿墙取直线，沿房间内部绕行；
+ * - 顶点必测：射线法采样会漏掉多边形角点，角点往往就是最远点；
+ * - 返回 connected=false 表示房间没有任何门/出口能接上自己的可行走区域，
+ *   调用方必须报错，不能静默放行。
+ */
+export function roomWorstPath(
+  roomPoly: Pt[],
+  sources: { pt: Pt; d0: number }[], // d0 = 到达该点后剩余的逃生路径（门→出口的走道段；房内出口为 0）
+  step: number,
+): { worstMm: number; point: Pt; connected: boolean } | null {
+  const walkMask = rasterizePolys([roomPoly], step);
+  if (!walkMask) return null;
+  const { ox, oy, nx, ny } = walkMask;
+  const srcs: { i: number; j: number; d: number }[] = [];
+  const addSource = (p: Pt, d0: number, snap: number) => {
+    if (d0 === Infinity) return;
+    // 点恰在边界栅格上时（门贴着走道共边、出口落在边线上）零残段直连，
+    // 与走道里人站在门口的实际一致
+    const di0 = Math.round((p.x - ox) / step);
+    const dj0 = Math.round((p.y - oy) / step);
+    if (di0 >= 0 && di0 < nx && dj0 >= 0 && dj0 < ny && walkMask.mask[dj0 * nx + di0] === 1) {
+      const residual = Math.hypot(ox + di0 * step - p.x, oy + dj0 * step - p.y);
+      if (residual < 1e-6) {
+        srcs.push({ i: di0, j: dj0, d: d0 });
+        return;
+      }
+    }
+    const land = nearestLanding(p, snap, walkMask);
+    if (land) srcs.push({ i: land.i, j: land.j, d: land.d + d0 });
+  };
+  for (const s of sources) addSource(s.pt, s.d0, s.d0 === 0 ? EXIT_SNAP_IN_ROOM : step); // 门贴房间边取 1 格；房内出口 2.5m
+  if (!srcs.length) return { worstMm: Infinity, point: roomPoly[0], connected: false };
+
+  const dd = gridDistances(walkMask, srcs);
+  let worst = -1;
+  let worstPt: Pt = roomPoly[0];
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      const v = dd[j * nx + i];
+      if (v !== Infinity && v > worst) {
+        worst = v;
+        worstPt = { x: ox + i * step, y: oy + j * step };
+      }
+    }
+  }
+  // 多边形顶点逐个补测（可能落在掩码外的角点：取最近可行走点 + 残段）
+  for (const p of roomPoly) {
+    const land = nearestLanding(p, step, walkMask);
+    if (!land) continue;
+    const v = land.d + dd[land.j * nx + land.i];
+    if (v > worst) {
+      worst = v;
+      worstPt = p;
+    }
+  }
+  if (worst < 0) return { worstMm: Infinity, point: roomPoly[0], connected: false };
+  return { worstMm: worst, point: worstPt, connected: true };
 }
 
 /**
@@ -298,35 +316,44 @@ export function buildCorridorGraph(
  *   直线走道两端都有出口时中点即袋口，深度 ≈ 0；仅一端有出口时深度 ≈ 走道全长。
  * - 单出口：整个区域只有一条逃生方向，整条走道视为袋形，depth(n) = d(n, 唯一出口)，取最远点。
  */
-function computeDeadEnd(perExit: Float64Array[], exitNodes: number[], nLattice: number): number {
-  const E = exitNodes.length;
+function computeDeadEnd(
+  perExit: Float64Array[],
+  exitLandings: Landing[],
+  nodeIdx: Int32Array,
+  walkMask: WalkMask,
+): number {
+  const E = exitLandings.length;
   if (E === 0) return 0;
+  const { nx } = walkMask;
+  const exitCells = exitLandings.map((l) => l.j * nx + l.i);
   if (E === 1) {
     const d = perExit[0];
     let max = 0;
-    for (let u = 0; u < nLattice; u++) {
-      const v = d[u];
+    for (let c = 0; c < nodeIdx.length; c++) {
+      const u = nodeIdx[c];
+      if (u < 0) continue;
+      const v = d[c];
       if (v !== Infinity && v > max) max = v;
     }
     return max;
   }
-  // 出口间路径距离 D[i][j] = perExit[i][出口 j 的附加节点]
   const D = new Float64Array(E * E);
   for (let i = 0; i < E; i++) {
-    for (let j = 0; j < E; j++) D[i * E + j] = perExit[i][exitNodes[j]];
+    for (let j = 0; j < E; j++) D[i * E + j] = perExit[i][exitCells[j]];
   }
   let max = 0;
-  for (let u = 0; u < nLattice; u++) {
+  for (let c = 0; c < nodeIdx.length; c++) {
+    if (nodeIdx[c] < 0) continue;
     let best = Infinity; // 该点由出口对算出的最小袋深
     let single = Infinity; // 仅可达一个出口时退化为该距离
     let finiteCnt = 0;
     for (let i = 0; i < E; i++) {
-      const di = perExit[i][u];
+      const di = perExit[i][c];
       if (di === Infinity) continue;
       finiteCnt++;
       single = di;
       for (let j = i + 1; j < E; j++) {
-        const dj = perExit[j][u];
+        const dj = perExit[j][c];
         if (dj === Infinity) continue;
         const dij = D[i * E + j];
         if (dij === Infinity) continue;

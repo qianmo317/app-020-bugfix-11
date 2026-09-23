@@ -5,8 +5,9 @@
  * 栅格 0.25m + 掩码 1 格膨胀：实测值相比手工值最多偏大 ~0.25m（最远点取在墙外侧一格），
  * 断言范围按 ±0.5m 容差给出。
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { mkFloor, mkRoom, rect, ruleWith, validateFloor } from './helpers';
+import * as geo from '../src/lib/geometry';
 import { MM_PER_M, dist } from '../src/lib/geometry';
 
 const OFFICE = { maxTravelDistanceM: 40, deadEndDistanceM: 22 } as const;
@@ -264,5 +265,108 @@ describe('疏散距离（沿路径）', () => {
     expect(r2.pass).toBe(false);
     expect(r2.items.some((i) => i.type === 'TRAVEL_EXCEED')).toBe(true);
     expect(OFFICE.maxTravelDistanceM).toBe(40); // 文档常量核对
+  });
+
+  // ---- 第二轮修复：真实可走路径（拐弯、共边、落点、房内绕行）----
+
+  it('21 两段走道端头留 0.4m 真缝（旧膨胀会桥接）：无出口的一段报 WALK_NOT_CONNECTED', () => {
+    const { floor, rules } = mkFloor(
+      [mkRoom('西', 'corridor', rect(0, 0, 20, 2)), mkRoom('东', 'corridor', rect(20.4, 0, 20, 2))],
+      [{ kind: 'exit', x: 0.5, y: 1 }],
+    );
+    const r = validateFloor(floor, ruleWith(rules, { deadEndDistanceM: 100 }));
+    expect(r.items.some((i) => i.type === 'WALK_NOT_CONNECTED')).toBe(true);
+    expect(r.pass).toBe(false);
+    // 东段不应被算成与西段连通：全局最远只应覆盖西段 ≈19.5m
+    expect(r.travelWorstM!).toBeGreaterThan(19.0);
+    expect(r.travelWorstM!).toBeLessThan(20.0);
+  });
+
+  it('22 两条平行走道间隔 0.5m（旧膨胀会穿墙桥接）：北段不可达', () => {
+    const { floor, rules } = mkFloor(
+      [mkRoom('南', 'corridor', rect(0, 0, 30, 2)), mkRoom('北', 'corridor', rect(0, 2.5, 30, 2))],
+      [{ kind: 'exit', x: 0.5, y: 1 }],
+    );
+    const r = validateFloor(floor, ruleWith(rules, { deadEndDistanceM: 100 }));
+    expect(r.items.some((i) => i.type === 'WALK_NOT_CONNECTED')).toBe(true);
+  });
+
+  it('23 出口落在墙外 2m（旧单向挂接会让全层距离静默丢失）：报 EXIT_NOT_CONNECTED', () => {
+    const { floor, rules } = mkFloor([mkRoom('走道', 'corridor', rect(0, 0, 20, 2))], [
+      { kind: 'exit', x: 10, y: 4 }, // 离走道 2m，且中间不是走道
+    ]);
+    const r = validateFloor(floor, rules);
+    expect(r.items.some((i) => i.type === 'EXIT_NOT_CONNECTED')).toBe(true);
+    expect(r.pass).toBe(false);
+  });
+
+  it('24 房间多边形顶点（最远角）必须计入采样：限值卡在网格点与顶点之间时仍判超标', () => {
+    // 门 x=4；最远角 (0,8) 沿路径 = 房内栅格 ≈7.8 + 门→出口 3.75 ≈ 11.6；
+    // 旧实现 0.5m 栅格直线到最远网格点只到 ≈10.3，限值 10.5 时会漏判。
+    const { floor, rules } = mkFloor(
+      [mkRoom('走道', 'corridor', rect(0, 0, 40, 2)), mkRoom('101', 'office', rect(0, 2, 8, 6))],
+      [{ kind: 'exit', x: 0.5, y: 1 }],
+    );
+    const r = validateFloor(floor, ruleWith(rules, { maxTravelDistanceM: 10.5, deadEndDistanceM: 100 }));
+    const room = r.items.find((i) => i.type === 'TRAVEL_EXCEED' && i.message.includes('101'));
+    expect(room).toBeDefined();
+    expect(room!.value!).toBeGreaterThan(11.3);
+    expect(room!.value!).toBeLessThan(12.0);
+  });
+
+  it('25 U 形房内沿可行走路径绕行（旧直线穿墙少算 ≈6m）', () => {
+    // U 形：x∈[0,12] y∈[0,10]，北侧凹口 x∈[4,8] y∈[8,10]；门在两翼北端，走道在北
+    const U = [
+      { x: 0, y: 0 }, { x: 12, y: 0 }, { x: 12, y: 10 }, { x: 8, y: 10 },
+      { x: 8, y: 8 }, { x: 4, y: 8 }, { x: 4, y: 10 }, { x: 0, y: 10 },
+    ].map((p) => ({ x: p.x * MM_PER_M, y: p.y * MM_PER_M }));
+    const { floor, rules } = mkFloor(
+      [mkRoom('走道', 'corridor', rect(0, 10, 40, 2)), mkRoom('U房', 'office', U)],
+      [{ kind: 'exit', x: 39.5, y: 11 }],
+    );
+    const r = validateFloor(floor, rules);
+    const room = r.items.find((i) => i.type === 'TRAVEL_EXCEED' && i.message.includes('U房'));
+    expect(room).toBeDefined();
+    // 房内最深处 (6,0)→门(2,10) 沿 U 内腔绕行 ≈14 + 门→出口 37.5 ≈ 44（0.25m 栅格容差）
+    expect(room!.value!).toBeGreaterThan(43.2);
+    expect(room!.value!).toBeLessThan(44.8);
+  });
+
+  it('26 门点接不上房间可行走区域（门落在墙外）：connected=false，引擎必须报错而非静默合格', async () => {
+    const { roomWorstPath } = await import('../src/lib/graph');
+    const room = rect(0, 0, 8, 6);
+    // 门点在墙外 2m，snap 1 格内无落点，且房内无出口
+    const r = roomWorstPath(room, [{ pt: { x: 4 * MM_PER_M, y: -2 * MM_PER_M }, d0: 10000 }], 250);
+    expect(r).not.toBeNull();
+    expect(r!.connected).toBe(false);
+    expect(r!.worstMm).toBe(Infinity);
+  });
+
+  it('26b 引擎端到端：门点存在但接不上走道时报 ROOM_UNREACHABLE（不静默放行）', () => {
+    // 走道与房间几何上共边（门推断成功），但把门点改到墙外 2m：
+    // 走道栅格 1.5m 吸附内无可行落点 → 该门在图里不可用 → 房间不可达
+    vi.spyOn(geo, 'doorCandidates').mockReturnValue([{ x: 4 * MM_PER_M, y: -2 * MM_PER_M }]);
+    try {
+      const { floor, rules } = mkFloor(
+        [mkRoom('走道', 'corridor', rect(0, 0, 40, 2)), mkRoom('孤房', 'office', rect(0, 2, 8, 6))],
+        [{ kind: 'exit', x: 39.5, y: 1 }],
+      );
+      const r = validateFloor(floor, ruleWith(rules, { deadEndDistanceM: 100 }));
+      expect(r.items.some((i) => i.type === 'ROOM_UNREACHABLE' && i.message.includes('孤房'))).toBe(true);
+      expect(r.pass).toBe(false);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('27 两段走道真实共边（Z 形）必须连通，不得误报不连通', () => {
+    const { floor, rules } = mkFloor(
+      [mkRoom('下段', 'corridor', rect(0, 0, 20, 2)), mkRoom('上段', 'corridor', rect(18, 2, 22, 2))],
+      [{ kind: 'exit', x: 39.5, y: 3 }],
+    );
+    const r = validateFloor(floor, ruleWith(rules, { deadEndDistanceM: 100 }));
+    expect(r.items.some((i) => i.type === 'WALK_NOT_CONNECTED')).toBe(false);
+    expect(r.travelWorstM!).toBeGreaterThan(40.0);
+    expect(r.travelWorstM!).toBeLessThan(41.5);
   });
 });

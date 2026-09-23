@@ -9,18 +9,17 @@ import type {
 } from '../model';
 import {
   MM_PER_M,
-  dist,
   gridPointsInPoly,
   pointInPoly,
   polyAreaM2,
   doorCandidates,
   bboxOf,
 } from './geometry';
-import { buildCorridorGraph, type DoorInput } from './graph';
+import { buildCorridorGraph, roomWorstPath, type DoorInput } from './graph';
 import { CHECK_INTERVAL_DAYS, OCCUPANCY_DENSITY_M2_PER_PERSON } from '../rules/defaults';
 
-const TRAVEL_STEP_MM = 250; // 走道栅格 0.25m，保证与手工沿路径测量误差 < 0.5m
-const ROOM_STEP_MM = 500; // 房间内部采样 0.5m
+const TRAVEL_STEP_MM = 250; // 走道/房间栅格 0.25m，保证与手工沿路径测量误差 < 0.5m
+const ROOM_STEP_MM = 250; // 房间内部采样 0.25m
 const COVERAGE_STEP_MM = 500; // 覆盖判定栅格 0.5m
 
 export type CoverageResult = {
@@ -117,24 +116,6 @@ export function computeCoverage(
   return { uncoveredM2, totalM2, pass: uncoveredM2 <= threshold, samples, cells: withCells ? cells : [] };
 }
 
-function roomWorstTravelM(room: Room, doors: Pt[], doorPathMm: number[], exitsInRoom: Pt[]): { worstM: number; point: Pt } | null {
-  // 采样点 = 房间内的栅格点
-  const pts = gridPointsInPoly(room.polygon, ROOM_STEP_MM);
-  if (!pts.length) return null;
-  let worst = -1;
-  let worstPt: Pt = pts[0];
-  for (const p of pts) {
-    let d = Infinity;
-    for (const e of exitsInRoom) d = Math.min(d, dist(p, e));
-    for (let i = 0; i < doors.length; i++) {
-      const di = dist(p, doors[i]) + doorPathMm[i]; // 全程毫米
-      if (di < d) d = di;
-    }
-    if (d > worst) { worst = d; worstPt = p; }
-  }
-  return { worstM: worst / MM_PER_M, point: worstPt };
-}
-
 function estimateOccupants(room: Room): number {
   if (room.occupants != null && room.occupants >= 0) return room.occupants;
   const density = OCCUPANCY_DENSITY_M2_PER_PERSON[room.usage] ?? 20;
@@ -165,11 +146,13 @@ export function checkDueInfo(facility: { kind: FacilityKind; checks: { date: str
 
 /**
  * 楼层合规校验（核心）：
- * 1) 疏散距离沿走道路径计算（走道栅格图 + Dijkstra），房间内为「最远点 → 房间门」直线段；
+ * 1) 疏散距离全程沿真实可行走路径计算：走道栅格图（边界包含式栅格化，无膨胀）+
+ *    多源 Dijkstra；出口/门先投影到掩码内可行走落点（连接段不得穿墙）；
+ *    房间内同样沿栅格路径（含多边形顶点）走到门/房内出口，再接走道段；
  * 2) 灭火器保护半径栅格采样覆盖判定；
  * 3) 安全出口数量 vs 面积/人数、出口与走道连通性；
  * 4) 袋形走道（死端）长度；
- * 5) 检查记录过期/缺失。
+ * 5) 走道断裂组分 / 房间不可达、检查记录过期/缺失。
  * 结果中记录当时使用的规则版本与依据文号（打印报告可见）。
  */
 export function validateFloor(floor: Floor, rules: RuleSet, now: number = Date.now()): ValidationResult {
@@ -186,14 +169,18 @@ export function validateFloor(floor: Floor, rules: RuleSet, now: number = Date.n
   let deadEndM: number | null = null;
 
   if (walkPolys.length && exitPts.length) {
-    // 房间门推断
-    const doorPtsByRoom = new Map<string, Pt[]>();
+    // 房间门推断（记录每个门在 doorInputs 中的序号，供逐门取走道段距离）
+    const doorPtsByRoom = new Map<string, { pt: Pt; inputIdx: number }[]>();
     const doorInputs: DoorInput[] = [];
     for (const r of nonWalkRooms) {
       const ds = doorCandidates(r.polygon, walkPolys);
       if (ds.length) {
-        doorPtsByRoom.set(r.id, ds);
-        for (const pt of ds) doorInputs.push({ roomId: r.id, pt });
+        const list = ds.map((pt) => {
+          const inputIdx = doorInputs.length;
+          doorInputs.push({ roomId: r.id, pt });
+          return { pt, inputIdx };
+        });
+        doorPtsByRoom.set(r.id, list);
       }
     }
     const g = buildCorridorGraph(walkPolys, exitPts, doorInputs, TRAVEL_STEP_MM);
@@ -205,7 +192,7 @@ export function validateFloor(floor: Floor, rules: RuleSet, now: number = Date.n
           type: 'EXIT_NOT_CONNECTED',
           facilityId: f.id,
           point: { x: f.x, y: f.y },
-          message: `安全出口 ${f.code} 未连接到${openPlan ? '房间区域' : '走道'}（周边 2.5m 内无可行走行区域）`,
+          message: `安全出口 ${f.code} 未连接到${openPlan ? '房间区域' : '走道'}（出口 2.5m 内没有全程可行走的落点，可能落在墙外或隔着房间）`,
         });
       }
     });
@@ -234,6 +221,15 @@ export function validateFloor(floor: Floor, rules: RuleSet, now: number = Date.n
           message: `袋形走道（死端）最大长度 ${deadEndM.toFixed(1)}m 超过限值 ${rules.deadEndDistanceM}m`,
         });
       }
+      // 存在与全部出口都不通的走道组分（两段走道看着相接、实际留缝/只斜角相碰）：
+      // 不能静默当作合格，按不可达报 error
+      if (g.hasUnreachable) {
+        items.push({
+          severity: 'error',
+          type: 'WALK_NOT_CONNECTED',
+          message: `部分走道区域无法到达任何安全出口（两段走道未真正共边连通，请检查走道端头是否留缝或仅在角点相碰）`,
+        });
+      }
     }
 
     // 各房间疏散距离
@@ -250,21 +246,34 @@ export function validateFloor(floor: Floor, rules: RuleSet, now: number = Date.n
         });
         continue;
       }
-      // 门对应的路径距离（毫米，与房内直线段同单位相加）
-      const doorPathMm: number[] = doors.map((d) => {
-        const idx = doorInputs.findIndex((di) => di.pt.x === d.x && di.pt.y === d.y);
-        return idx >= 0 && g.doorDist[idx] !== Infinity ? g.doorDist[idx] : Infinity;
-      });
-      const res = roomWorstTravelM(r, doors, doorPathMm, exitsInRoom);
-      if (res && res.worstM > rules.maxTravelDistanceM + 0.001) {
+      // 房内同样沿可行走路径计算：房内栅格∪多边形顶点 → 门/房内出口，
+      // 门源带上「门 → 最近出口」的走道段距离
+      const sources = [
+        ...doors.map((d) => ({ pt: d.pt, d0: g.doorDist[d.inputIdx] })),
+        ...exitsInRoom.map((p) => ({ pt: p, d0: 0 })),
+      ];
+      const res = roomWorstPath(r.polygon, sources, ROOM_STEP_MM);
+      if (!res) continue;
+      if (!res.connected) {
+        items.push({
+          severity: 'error',
+          type: 'ROOM_UNREACHABLE',
+          roomId: r.id,
+          point: res.point,
+          message: `房间「${r.name}」内区域无法经任何门或房内出口到达走道（门可能未真正接到可行走区域），疏散距离不可达`,
+        });
+        continue;
+      }
+      const worstM = res.worstMm / MM_PER_M;
+      if (worstM > rules.maxTravelDistanceM + 0.001) {
         items.push({
           severity: 'error',
           type: 'TRAVEL_EXCEED',
           roomId: r.id,
           point: res.point,
-          value: res.worstM,
+          value: worstM,
           limit: rules.maxTravelDistanceM,
-          message: `房间「${r.name}」疏散距离 ${res.worstM.toFixed(1)}m 超过限值 ${rules.maxTravelDistanceM}m（沿路径计算）`,
+          message: `房间「${r.name}」疏散距离 ${worstM.toFixed(1)}m 超过限值 ${rules.maxTravelDistanceM}m（沿路径计算）`,
         });
       }
     }

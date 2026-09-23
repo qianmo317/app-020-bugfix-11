@@ -112,6 +112,86 @@ export function doorCandidates(room: Pt[], corridors: Pt[][], probeMm = 80, samp
   return doors;
 }
 
+/** 多边形并集栅格掩码：包含多边形内部点与恰落在边界上的点。
+ *
+ * 关键点：不能做栅格膨胀。膨胀会把两多边形之间的真缝（两堵平行墙、留缝的走道端头）
+ * 也桥接成连通，制造穿墙捷径、系统性偏小疏散距离。
+ * 边界点通过「沿每条边以 1/4 步长细采样 → 标记取整格」补入：共边多边形在共享边处
+ * 天然连通；斜边上每个对齐栅格的边点都会被某个采样点覆盖。只补边本身经过的格子，
+ * 绝不外扩邻格——0.25m 步长下最多残留 <0.25m 的表示误差，真缝（≥0.5m）一律不连通。
+ */
+export type WalkMask = {
+  step: number;
+  ox: number;
+  oy: number;
+  nx: number;
+  ny: number;
+  mask: Uint8Array;
+};
+
+export function rasterizePolys(polys: Pt[][], step: number): WalkMask | null {
+  if (!polys.length) return null;
+  const bb = bboxOf(polys);
+  if (!Number.isFinite(bb.minX)) return null;
+  const ox = Math.floor(bb.minX / step) * step;
+  const oy = Math.floor(bb.minY / step) * step;
+  const nx = Math.ceil((bb.maxX - ox) / step) + 1;
+  const ny = Math.ceil((bb.maxY - oy) / step) + 1;
+  if (nx * ny > 8_000_000) throw new Error('floor too large for grid');
+  const mask = new Uint8Array(nx * ny);
+  const markCell = (i: number, j: number) => {
+    if (i >= 0 && i < nx && j >= 0 && j < ny) mask[j * nx + i] = 1;
+  };
+  for (const poly of polys) {
+    const pbb = bboxOf([poly]);
+    const i0 = Math.max(0, Math.floor((pbb.minX - ox) / step));
+    const i1 = Math.min(nx - 1, Math.ceil((pbb.maxX - ox) / step));
+    const j0 = Math.max(0, Math.floor((pbb.minY - oy) / step));
+    const j1 = Math.min(ny - 1, Math.ceil((pbb.maxY - oy) / step));
+    for (let j = j0; j <= j1; j++) {
+      for (let i = i0; i <= i1; i++) {
+        if (pointInPoly({ x: ox + i * step, y: oy + j * step }, poly)) mask[j * nx + i] = 1;
+      }
+    }
+    // 边界补点：射线法会排除边界行/列，沿边细采样把边界栅格点加回来。
+    // 只标记采样点取整后的那一格：细步长保证对齐边的每一格都会落到；
+    // 斜边上离格心略远的边点由相邻采样点覆盖，绝不额外补记邻格——
+    // 补记邻格会把两多边形之间的真缝（平行墙、留缝的走道端头）桥成连通。
+    const SUB = 0.25; // 每步长内 4 个采样点，步长方向分量必 < 1 格，无遗漏
+    for (let e = 0; e < poly.length; e++) {
+      const a = poly[e], b = poly[(e + 1) % poly.length];
+      const elen = dist(a, b);
+      const n = Math.max(1, Math.ceil(elen / (step * SUB)));
+      for (let k = 0; k <= n; k++) {
+        const t = k / n;
+        const px = a.x + (b.x - a.x) * t;
+        const py = a.y + (b.y - a.y) * t;
+        const ci = Math.round((px - ox) / step);
+        const cj = Math.round((py - oy) / step);
+        markCell(ci, cj);
+      }
+    }
+  }
+  return { step, ox, oy, nx, ny, mask };
+}
+
+/** 连接段是否全程落在可行走区域内（防止出口/门穿墙挂到墙后栅格）。
+ * 起点（如墙外出口点）允许在区域外，从靠近落点一侧开始采样。 */
+export function segmentClear(a: Pt, b: Pt, mask: WalkMask): boolean {
+  const { step, ox, oy, nx, ny, mask: m } = mask;
+  const len = dist(a, b);
+  const n = Math.max(1, Math.min(60, Math.ceil(len / (step / 2))));
+  for (let k = 1; k <= n; k++) {
+    const t = k / n;
+    const px = a.x + (b.x - a.x) * t;
+    const py = a.y + (b.y - a.y) * t;
+    const i = Math.round((px - ox) / step);
+    const j = Math.round((py - oy) / step);
+    if (i < 0 || i >= nx || j < 0 || j >= ny || m[j * nx + i] !== 1) return false;
+  }
+  return true;
+}
+
 /** 按比例尺取一个「好看」的比例尺长度（米） */
 export function niceScaleBarM(maxM: number): number {
   const candidates = [1, 2, 5, 10, 20, 50, 100];
