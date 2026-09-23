@@ -6,6 +6,7 @@ const TYPE_LABELS: Record<string, string> = {
   DEADEND_EXCEED: '袋形走道超限',
   EXIT_COUNT: '安全出口数量',
   EXIT_NOT_CONNECTED: '出口未连通',
+  DOOR_NOT_CONNECTED: '房门未接入走道',
   COVERAGE_UNCOVERED: '灭火器覆盖不足',
   CHECK_OVERDUE: '检查过期',
   CHECK_MISSING: '缺检查记录',

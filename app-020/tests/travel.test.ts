@@ -8,6 +8,7 @@
 import { describe, it, expect } from 'vitest';
 import { mkFloor, mkRoom, rect, ruleWith, validateFloor } from './helpers';
 import { MM_PER_M, dist } from '../src/lib/geometry';
+import { buildCorridorGraph } from '../src/lib/graph';
 
 const OFFICE = { maxTravelDistanceM: 40, deadEndDistanceM: 22 } as const;
 
@@ -264,5 +265,92 @@ describe('疏散距离（沿路径）', () => {
     expect(r2.pass).toBe(false);
     expect(r2.items.some((i) => i.type === 'TRAVEL_EXCEED')).toBe(true);
     expect(OFFICE.maxTravelDistanceM).toBe(40); // 文档常量核对
+  });
+
+  it('21 出口隔着非走道空间（1.5~2.5m）：旧版 exitConnected=true 但整层距离静默 null，现在必须判未连通', () => {
+    const { floor, rules } = mkFloor([mkRoom('走道', 'corridor', rect(0, 0, 30, 2))], [
+      { kind: 'exit', x: 15, y: 4 }, // 距走道边 2m，中间不是可行走区域
+    ]);
+    const r = validateFloor(floor, rules);
+    expect(r.items.some((i) => i.type === 'EXIT_NOT_CONNECTED')).toBe(true);
+    // 对照：出口贴边 0.2m（半格内画点余量）必须正常接入，不能误报
+    const { floor: f2, rules: r2 } = mkFloor([mkRoom('走道', 'corridor', rect(0, 0, 30, 2))], [
+      { kind: 'exit', x: 15, y: 2.2 },
+    ]);
+    const ok = validateFloor(f2, r2);
+    expect(ok.items.some((i) => i.type === 'EXIT_NOT_CONNECTED')).toBe(false);
+    expect(ok.travelWorstM).not.toBeNull();
+  });
+
+  it('22 两段走道间留真缝隙（>0.5m）：不得靠膨胀虚桥连通，远端必须不可达', () => {
+    const { floor, rules } = mkFloor(
+      [mkRoom('下段', 'corridor', rect(0, 0, 20, 2)), mkRoom('上段', 'corridor', rect(20.51, 0, 20, 2))],
+      [{ kind: 'exit', x: 40.0, y: 1 }],
+    );
+    const g = buildCorridorGraph(
+      [rect(0, 0, 20, 2), rect(20.51, 0, 20, 2)],
+      [{ x: 40 * MM_PER_M, y: 1 * MM_PER_M }],
+      [],
+      250,
+    );
+    const u = g.nodeAtLattice(1 * MM_PER_M, 1 * MM_PER_M);
+    expect(g.dist[u]).toBe(Infinity);
+    // 对照：真正共边（端部相接）必须连通且距离沿走道算
+    const g2 = buildCorridorGraph(
+      [rect(0, 0, 20, 2), rect(20, 0, 20, 2)],
+      [{ x: 39.5 * MM_PER_M, y: 1 * MM_PER_M }],
+      [],
+      250,
+    );
+    const u2 = g2.nodeAtLattice(0.5 * MM_PER_M, 1 * MM_PER_M);
+    expect(g2.dist[u2] / MM_PER_M).toBeGreaterThan(38.4);
+    expect(g2.dist[u2] / MM_PER_M).toBeLessThan(39.6);
+    // floor 校验仍能运行且不崩
+    expect(validateFloor(floor, rules).items.some((i) => i.type === 'EXIT_NOT_CONNECTED')).toBe(false);
+  });
+
+  it('23 小房间内部无 0.5m 栅格点：顶点仍参与，房间里的点到门这一段必须算出来', () => {
+    const { floor, rules } = mkFloor(
+      [mkRoom('走道', 'corridor', rect(0, 0, 41, 2)), mkRoom('小房', 'office', rect(5, 2, 1, 1))],
+      [{ kind: 'exit', x: 40.5, y: 1 }],
+    );
+    // 限值收到 36：顶点 (6,3)→门(5.5,2) ≈1.12m + 门→出口 ≈35.41m = 36.53m 应判超；
+    // 旧版只有 0.5m 栅格点（实际落在 (5.5,2.5)），会算成 36.06m
+    const r = validateFloor(floor, ruleWith(rules, { maxTravelDistanceM: 36 }));
+    const item = r.items.find((i) => i.type === 'TRAVEL_EXCEED' && i.message.includes('小房'));
+    expect(item).toBeDefined();
+    expect(item!.value!).toBeGreaterThan(36.2);
+    expect(item!.value!).toBeLessThan(37.0);
+  });
+
+  it('24 U 形双拐弯走道：沿走道走，不切角', () => {
+    // 底横 0..20 × 0..2，右竖 18..20 × 0..12，顶横 0..20 × 10..14，出口 (1,13)
+    const { floor, rules } = mkFloor(
+      [
+        mkRoom('底', 'corridor', rect(0, 0, 20, 2)),
+        mkRoom('竖', 'corridor', rect(18, 0, 2, 12)),
+        mkRoom('顶', 'corridor', rect(0, 10, 20, 4)),
+      ],
+      [{ kind: 'exit', x: 1, y: 13 }],
+    );
+    const w = validateFloor(floor, rules).travelWorstM!;
+    // 手工沿走道（两次 90° 拐弯，允许格点斜切）≈45m；直线 (1,1)→(1,13) 仅 12m
+    expect(w).toBeGreaterThan(44);
+    expect(w).toBeLessThan(46);
+    const straight = dist({ x: 1 * MM_PER_M, y: 1 * MM_PER_M }, { x: 1 * MM_PER_M, y: 13 * MM_PER_M }) / MM_PER_M;
+    expect(w - straight).toBeGreaterThan(30);
+  });
+
+  it('25 门/出口的接入边不得穿墙：门点周围整圈直连的旧行为不再产生短路径', () => {
+    // 走道 0..30 × 0..2，出口在走道内部远端；门点在共边 (15,2) 上，吸附边必须沿走道
+    const g = buildCorridorGraph(
+      [rect(0, 0, 30, 2)],
+      [{ x: 29.5 * MM_PER_M, y: 1 * MM_PER_M }],
+      [{ roomId: 'r', pt: { x: 15 * MM_PER_M, y: 2 * MM_PER_M } }],
+      250,
+    );
+    expect(g.doorDist[0]).not.toBe(Infinity);
+    expect(g.doorDist[0] / MM_PER_M).toBeGreaterThan(14.0); // 门→出口沿走道 ≈14.7m
+    expect(g.doorDist[0] / MM_PER_M).toBeLessThan(15.3);
   });
 });

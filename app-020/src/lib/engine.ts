@@ -118,8 +118,13 @@ export function computeCoverage(
 }
 
 function roomWorstTravelM(room: Room, doors: Pt[], doorPathMm: number[], exitsInRoom: Pt[]): { worstM: number; point: Pt } | null {
-  // 采样点 = 房间内的栅格点
+  // 采样点 = 房间内 0.5m 栅格点 + 全部多边形顶点。
+  // 顶点必须参与：非凸房间的最远角、以及窄于/小于一格（0.5m）的小房间内部没有栅格点，
+  // 漏了顶点会让「房间里的点到门这一段」系统性算短甚至整间返回 null（该判超标的位置漏判）。
   const pts = gridPointsInPoly(room.polygon, ROOM_STEP_MM);
+  for (const v of room.polygon) {
+    if (!pts.some((p) => p.x === v.x && p.y === v.y)) pts.push(v);
+  }
   if (!pts.length) return null;
   let worst = -1;
   let worstPt: Pt = pts[0];
@@ -187,13 +192,17 @@ export function validateFloor(floor: Floor, rules: RuleSet, now: number = Date.n
 
   if (walkPolys.length && exitPts.length) {
     // 房间门推断
-    const doorPtsByRoom = new Map<string, Pt[]>();
+    type DoorEntry = { roomId: string; roomName: string; pt: Pt };
+    const doorsByRoom = new Map<string, DoorEntry[]>();
     const doorInputs: DoorInput[] = [];
+    const doorBaseByRoom = new Map<string, number>(); // 该房间第一个门在 doorInputs/g.doorDist 中的下标
     for (const r of nonWalkRooms) {
       const ds = doorCandidates(r.polygon, walkPolys);
       if (ds.length) {
-        doorPtsByRoom.set(r.id, ds);
-        for (const pt of ds) doorInputs.push({ roomId: r.id, pt });
+        const entries: DoorEntry[] = ds.map((pt) => ({ roomId: r.id, roomName: r.name, pt }));
+        doorsByRoom.set(r.id, entries);
+        doorBaseByRoom.set(r.id, doorInputs.length);
+        doorInputs.push(...entries.map((e) => ({ roomId: e.roomId, pt: e.pt })));
       }
     }
     const g = buildCorridorGraph(walkPolys, exitPts, doorInputs, TRAVEL_STEP_MM);
@@ -205,7 +214,7 @@ export function validateFloor(floor: Floor, rules: RuleSet, now: number = Date.n
           type: 'EXIT_NOT_CONNECTED',
           facilityId: f.id,
           point: { x: f.x, y: f.y },
-          message: `安全出口 ${f.code} 未连接到${openPlan ? '房间区域' : '走道'}（周边 2.5m 内无可行走行区域）`,
+          message: `安全出口 ${f.code} 未连通${openPlan ? '房间区域' : '走道'}（2.5m 内没有沿可行走区域可达的落点，可能距离过远或被墙体阻断）`,
         });
       }
     });
@@ -240,8 +249,8 @@ export function validateFloor(floor: Floor, rules: RuleSet, now: number = Date.n
     for (const r of floor.rooms) {
       if (r.usage === 'corridor') continue;
       const exitsInRoom = exitPts.filter((p) => pointInPoly(p, r.polygon));
-      const doors = doorPtsByRoom.get(r.id) ?? [];
-      if (!exitsInRoom.length && !doors.length) {
+      const entries = doorsByRoom.get(r.id) ?? [];
+      if (!exitsInRoom.length && !entries.length) {
         items.push({
           severity: 'warning',
           type: 'NO_DOOR',
@@ -250,11 +259,21 @@ export function validateFloor(floor: Floor, rules: RuleSet, now: number = Date.n
         });
         continue;
       }
-      // 门对应的路径距离（毫米，与房内直线段同单位相加）
-      const doorPathMm: number[] = doors.map((d) => {
-        const idx = doorInputs.findIndex((di) => di.pt.x === d.x && di.pt.y === d.y);
-        return idx >= 0 && g.doorDist[idx] !== Infinity ? g.doorDist[idx] : Infinity;
-      });
+      // g.doorDist 的下标与 doorInputs 对齐（构建顺序一致）
+      const base = doorBaseByRoom.get(r.id) ?? 0;
+      const doors = entries.map((e) => e.pt);
+      const doorPathMm: number[] = entries.map((_, k) => g.doorDist[base + k]);
+      const disconnected = entries.length > 0 && exitsInRoom.length === 0 && doorPathMm.every((d) => d === Infinity);
+      if (disconnected) {
+        items.push({
+          severity: 'error',
+          type: 'DOOR_NOT_CONNECTED',
+          roomId: r.id,
+          point: entries[0].pt,
+          message: `房间「${r.name}」的门无法接入走道路径（门与可走区域之间被墙体阻断），该房间人员无法到达任何安全出口`,
+        });
+        continue;
+      }
       const res = roomWorstTravelM(r, doors, doorPathMm, exitsInRoom);
       if (res && res.worstM > rules.maxTravelDistanceM + 0.001) {
         items.push({
@@ -269,13 +288,16 @@ export function validateFloor(floor: Floor, rules: RuleSet, now: number = Date.n
       }
     }
 
-    // 走道房间各自的最差点（用于定位提示）
+    // 走道房间各自的最差点（用于定位提示）；含顶点，避免窄走道无内部采样点
     if (!openPlan) {
       for (const r of corridorRooms) {
-        const pts = gridPointsInPoly(r.polygon, TRAVEL_STEP_MM);
+        const cand = gridPointsInPoly(r.polygon, TRAVEL_STEP_MM);
+        for (const v of r.polygon) {
+          if (!cand.some((p) => p.x === v.x && p.y === v.y)) cand.push(v);
+        }
         let worst = -1;
         let wp: Pt | null = null;
-        for (const p of pts) {
+        for (const p of cand) {
           const u = g.nodeAtLattice(p.x, p.y);
           if (u >= 0 && g.dist[u] !== Infinity && g.dist[u] > worst) {
             worst = g.dist[u];
